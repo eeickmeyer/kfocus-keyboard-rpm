@@ -1,0 +1,92 @@
+diff --git a/src/clevo_acpi.c b/src/clevo_acpi.c
+index ff2c1d0..655e6e4 100644
+--- a/src/clevo_acpi.c
++++ b/src/clevo_acpi.c
+@@ -21,6 +21,9 @@
+ #include <linux/module.h>
+ #include <linux/acpi.h>
+ #include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
++#include <linux/platform_device.h>
++#endif
+ #include <linux/string.h>
+ #include "clevo_interfaces.h"
+ 
+@@ -244,6 +247,56 @@ static const struct acpi_device_id clevo_acpi_device_ids[] = {
+ 	{"", 0}
+ };
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
++static void clevo_platform_notify(acpi_handle handle, u32 event, void *context)
++{
++	clevo_acpi_notify(context, event);
++}
++
++static int clevo_platform_probe(struct platform_device *pdev)
++{
++	struct acpi_device *device = ACPI_COMPANION(&pdev->dev);
++	int ret;
++
++	if (!device)
++		return -ENODEV;
++
++	ret = clevo_acpi_add(device);
++	if (ret)
++		return ret;
++
++	ret = acpi_dev_install_notify_handler(device, ACPI_ALL_NOTIFY,
++					      clevo_platform_notify, device);
++	if (ret) {
++		clevo_acpi_remove(device);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void clevo_platform_remove(struct platform_device *pdev)
++{
++	struct acpi_device *device = ACPI_COMPANION(&pdev->dev);
++
++	acpi_dev_remove_notify_handler(device, ACPI_ALL_NOTIFY, clevo_platform_notify);
++	clevo_acpi_remove(device);
++}
++
++static struct platform_driver clevo_acpi_driver = {
++	.probe = clevo_platform_probe,
++	.remove = clevo_platform_remove,
++	.driver = {
++		.name = DRIVER_NAME,
++		.acpi_match_table = clevo_acpi_device_ids,
++#ifdef CONFIG_PM
++		.pm = &clevo_driver_pm_ops,
++#endif
++	},
++};
++
++module_platform_driver(clevo_acpi_driver);
++#else
+ static struct acpi_driver clevo_acpi_driver = {
+ 	.name = DRIVER_NAME,
+ 	.class = DRIVER_NAME,
+@@ -263,6 +316,7 @@ static struct acpi_driver clevo_acpi_driver = {
+ };
+ 
+ module_acpi_driver(clevo_acpi_driver);
++#endif
+ 
+ MODULE_AUTHOR("TUXEDO Computers GmbH <tux@tuxedocomputers.com>");
+ MODULE_DESCRIPTION("Driver for Clevo ACPI interface");
+diff --git a/src/clevo_keyboard.h b/src/clevo_keyboard.h
+index 7bc698e..4c58da0 100644
+--- a/src/clevo_keyboard.h
++++ b/src/clevo_keyboard.h
+@@ -648,7 +648,7 @@ static int set_zonekb_color_string(const char *color_string, size_t size)
+ 	color_string_copy = kzalloc(size + 1, GFP_KERNEL);
+ 	if (!color_string_copy)
+ 		return -ENOMEM;
+-	strncpy(color_string_copy, color_string, size);
++	memcpy(color_string_copy, color_string, size);
+ 	color_string_copy[size] = '\0';
+ 	color_string_sep = color_string_copy;
+ 

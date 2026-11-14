@@ -3,11 +3,12 @@
 
 Name:           kfocus-keyboard
 Version:        3.1.4
-Release:        9%{?dist}
+Release:        10%{?dist}
 Summary:        DKMS keyboard driver for Kubuntu Focus systems
 License:        GPL-3.0-or-later
 URL:            https://github.com/eeickmeyer/kfocus-keyboard
 Source0:        https://github.com/eeickmeyer/kfocus-keyboard/archive/%{commit}.tar.gz
+Patch0:         linux-7.3-compat.patch
 BuildArch:      noarch
 Requires:       dkms >= 2.1.0
 
@@ -16,13 +17,13 @@ Keyboard and keyboard backlight driver sources for TUXEDO and Kubuntu Focus
 notebooks, installed and built for supported kernels through DKMS.
 
 %prep
-%autosetup -n kfocus-keyboard-%{commit}
+%autosetup -p1 -n kfocus-keyboard-%{commit}
 
 %build
 
 %install
 install -d %{buildroot}%{_usrsrc}/%{module}-%{version}
-install -pm 0644 dkms.conf Makefile \
+install -pm 0644 dkms.conf Makefile Kbuild \
     %{buildroot}%{_usrsrc}/%{module}-%{version}/
 cp -a src %{buildroot}%{_usrsrc}/%{module}-%{version}/
 
@@ -49,5 +50,8 @@ fi
 %config(noreplace) %{_sysconfdir}/modprobe.d/tuxedo_keyboard.conf
 
 %changelog
+* Sat Nov 14 2026 Kubuntu Focus Team <support@kfocus.org> - 3.1.4-10
+- Include Kbuild and support Linux 7.3
+
 * Sat Nov 14 2026 Kubuntu Focus Team <support@kfocus.org> - 3.1.4-9
 - Package the DKMS driver for Fedora
