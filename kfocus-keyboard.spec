@@ -3,13 +3,14 @@
 
 Name:           kfocus-keyboard
 Version:        3.1.4
-Release:        11%{?dist}
+Release:        12%{?dist}
 Summary:        DKMS keyboard driver for Kubuntu Focus systems
 License:        GPL-3.0-or-later
 URL:            https://github.com/eeickmeyer/kfocus-keyboard
 Source0:        https://github.com/eeickmeyer/kfocus-keyboard/archive/%{commit}.tar.gz
 Patch0:         linux-7.3-compat.patch
 Patch1:         clevo-kbd-backlight.patch
+Patch2:         clevo-white-backlight.patch
 BuildArch:      noarch
 Requires:       dkms >= 2.1.0
 
@@ -51,6 +52,9 @@ fi
 %config(noreplace) %{_sysconfdir}/modprobe.d/tuxedo_keyboard.conf
 
 %changelog
+* Sat Nov 14 2026 Kubuntu Focus Team <support@kfocus.org> - 3.1.4-12
+- Detect the keyboard backlight type and support fixed-color firmware
+
 * Sat Nov 14 2026 Kubuntu Focus Team <support@kfocus.org> - 3.1.4-11
 - Expose the Clevo keyboard backlight to Plasma through the LED class
 

@@ -12,6 +12,8 @@ tmp=$(mktemp -d)
 trap 'rm -f -- "$tmp/backlight-functions.h" "$tmp/test-backlight"; rmdir -- "$tmp"' EXIT
 
 for function in \
+    'static int clevo_white_brightness_read(' \
+    'static u8 clevo_led_value(' \
     'static enum led_brightness clevo_kbd_brightness_get(' \
     'static void clevo_kbd_brightness_notify(' \
     'static int clevo_set_brightness(' \
@@ -20,7 +22,8 @@ for function in \
     'static int set_enabled_cmd(' \
     'static int set_enabled(' \
     'static int set_zonekb_color(' \
-    'void clevo_keyboard_event_callb(u32 event)$'
+    'void clevo_keyboard_event_callb(u32 event)$' \
+    'static int clevo_detect_backlight('
 do
     sed -n "\|^$function|,/^}/p" "$source_file" >> "$tmp/backlight-functions.h"
 done

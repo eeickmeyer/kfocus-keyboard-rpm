@@ -1,0 +1,309 @@
+--- a/src/clevo_acpi.c
++++ b/src/clevo_acpi.c
+@@ -158,10 +158,31 @@
+ 	return status;
+ }
+ 
++static int clevo_acpi_get_specs(u8 *type)
++{
++	union acpi_object arg = { .integer.type = ACPI_TYPE_INTEGER, .integer.value = 0 };
++	union acpi_object *result = NULL;
++	int status;
++
++	if (IS_ERR_OR_NULL(active_driver_data))
++		return -ENODEV;
++	status = clevo_acpi_evaluate(active_driver_data->adev, 0x0d, arg, &result);
++	if (status)
++		return status;
++	if (!result || result->type != ACPI_TYPE_BUFFER || result->buffer.length <= 0x0f) {
++		ACPI_FREE(result);
++		return -ENODATA;
++	}
++	*type = result->buffer.pointer[0x0f];
++	ACPI_FREE(result);
++	return 0;
++}
++
+ struct clevo_interface_t clevo_acpi_interface = {
+ 	.string_id = CLEVO_INTERFACE_ACPI_STRID,
+ 	.method_call = clevo_acpi_interface_method_call,
+-	.buffer_method_call = clevo_acpi_interface_buffer_method_call
++	.buffer_method_call = clevo_acpi_interface_buffer_method_call,
++	.get_specs = clevo_acpi_get_specs
+ };
+ 
+ static int clevo_acpi_add(struct acpi_device *device)
+--- a/src/clevo_wmi.c
++++ b/src/clevo_wmi.c
+@@ -69,9 +69,31 @@
+ 	return clevo_wmi_evaluate(cmd, arg, result_value);
+ }
+ 
++static int clevo_wmi_get_specs(u8 *type)
++{
++	u32 arg = 0;
++	struct acpi_buffer in = { sizeof(arg), &arg };
++	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
++	union acpi_object *result;
++	acpi_status status;
++	int err = 0;
++
++	status = wmi_evaluate_method(CLEVO_WMI_METHOD_GUID, 0, 0x0d, &in, &out);
++	if (ACPI_FAILURE(status))
++		return -EIO;
++	result = out.pointer;
++	if (!result || result->type != ACPI_TYPE_BUFFER || result->buffer.length <= 0x0f)
++		err = -ENODATA;
++	else
++		*type = result->buffer.pointer[0x0f];
++	kfree(result);
++	return err;
++}
++
+ struct clevo_interface_t clevo_wmi_interface = {
+ 	.string_id = CLEVO_INTERFACE_WMI_STRID,
+ 	.method_call = clevo_wmi_interface_method_call,
++	.get_specs = clevo_wmi_get_specs,
+ };
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
+--- a/src/clevo_interfaces.h
++++ b/src/clevo_interfaces.h
+@@ -53,6 +53,7 @@
+ 	void (*event_callb)(u32);
+ 	u32 (*method_call)(u8, u32, u32*);
+  	u32 (*buffer_method_call)(u8, u8*, u32);
++	int (*get_specs)(u8 *type);
+ };
+ 
+ u32 clevo_keyboard_add_interface(struct clevo_interface_t *new_interface);
+--- a/src/clevo_keyboard.h
++++ b/src/clevo_keyboard.h
+@@ -21,6 +21,7 @@
+ #include <linux/string.h>
+ #include <linux/dmi.h>
+ #include <linux/leds.h>
++#include <linux/delay.h>
+ 
+ #include "tuxedo_keyboard_common.h"
+ #include "clevo_interfaces.h"
+@@ -47,6 +48,16 @@
+ #define CLEVO_METHOD_ID_SET_KB_LEDS	0x67 /* used to set color, brightness,
+ 	                                        blinking pattern, etc. */
+ #define CLEVO_METHOD_ID_SET_ZONEKB_LEDS 0x04 // Only on certain machines (m2g6)
++#define CLEVO_METHOD_GET_WHITE_BRIGHTNESS 0x3d
++#define CLEVO_METHOD_SET_WHITE_BRIGHTNESS 0x27
++#define CLEVO_METHOD_GET_BIOS_FEATURES_1 0x52
++#define CLEVO_METHOD_GET_BIOS_FEATURES_2 0x7a
++#define CLEVO_BACKLIGHT_FIXED_COLOR 1
++#define CLEVO_BACKLIGHT_3_ZONE_RGB 2
++#define CLEVO_BACKLIGHT_1_ZONE_RGB 6
++#define CLEVO_FEATURE_WHITE_KEYBOARD 0x40000000
++#define CLEVO_FEATURE_3_ZONE_RGB_KEYBOARD 0x00400000
++#define CLEVO_FEATURE_WHITE_FIVE_LEVELS 0x4000
+ 
+ 
+ // Clevo event codes
+@@ -255,13 +266,39 @@
+ static struct led_classdev clevo_kbd_backlight;
+ static DEFINE_MUTEX(clevo_kbd_backlight_lock);
+ static bool clevo_kbd_backlight_registered;
++static u8 clevo_backlight_type;
++static u8 clevo_white_max = 2;
++
++static int clevo_white_brightness_read(void)
++{
++	u32 brightness;
++	int err = clevo_evaluate_method(CLEVO_METHOD_GET_WHITE_BRIGHTNESS, 0, &brightness);
++
++	if (err)
++		return err;
++	if (brightness > clevo_white_max)
++		return -ERANGE;
++	kbd_led_state.enabled = brightness != 0;
++	kbd_led_state.brightness = DIV_ROUND_CLOSEST(brightness * BRIGHTNESS_MAX,
++						     clevo_white_max);
++	return 0;
++}
++
++static u8 clevo_led_value(void)
++{
++	u8 brightness = kbd_led_state.enabled ? kbd_led_state.brightness : 0;
++
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR)
++		return DIV_ROUND_CLOSEST(brightness * clevo_white_max, BRIGHTNESS_MAX);
++	return brightness;
++}
+ 
+ static enum led_brightness clevo_kbd_brightness_get(struct led_classdev *led)
+ {
+ 	enum led_brightness brightness;
+ 
+ 	mutex_lock(&clevo_kbd_backlight_lock);
+-	brightness = kbd_led_state.enabled ? kbd_led_state.brightness : 0;
++	brightness = clevo_led_value();
+ 	mutex_unlock(&clevo_kbd_backlight_lock);
+ 	return brightness;
+ }
+@@ -271,7 +308,7 @@
+ {
+ 	if (clevo_kbd_backlight_registered)
+ 		led_classdev_notify_brightness_hw_changed(&clevo_kbd_backlight,
+-			kbd_led_state.enabled ? kbd_led_state.brightness : 0);
++							 clevo_led_value());
+ }
+ 
+ static struct blinking_pattern_t blinking_patterns[] = {
+@@ -407,8 +444,15 @@
+ 	int err;
+ 
+ 	TUXEDO_INFO("Set brightness on %d", brightness);
+-	err = clevo_evaluate_method(CLEVO_METHOD_ID_SET_KB_LEDS,
+-				    KEYBOARD_BRIGHTNESS | brightness, NULL);
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR) {
++		u8 level = DIV_ROUND_CLOSEST(brightness * clevo_white_max, BRIGHTNESS_MAX);
++
++		err = clevo_evaluate_method(CLEVO_METHOD_SET_WHITE_BRIGHTNESS, level, NULL);
++		brightness = DIV_ROUND_CLOSEST(level * BRIGHTNESS_MAX, clevo_white_max);
++	} else {
++		err = clevo_evaluate_method(CLEVO_METHOD_ID_SET_KB_LEDS,
++					    KEYBOARD_BRIGHTNESS | brightness, NULL);
++	}
+ 	if (err) {
+ 		TUXEDO_ERROR("Failed to set keyboard brightness: %d\n", err);
+ 		return err;
+@@ -437,6 +481,8 @@
+ 	int err;
+ 
+ 	mutex_lock(&clevo_kbd_backlight_lock);
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR)
++		brightness = DIV_ROUND_CLOSEST(brightness * BRIGHTNESS_MAX, clevo_white_max);
+ 	err = clevo_set_brightness(brightness);
+ 	mutex_unlock(&clevo_kbd_backlight_lock);
+ 	return err;
+@@ -467,6 +513,11 @@
+ 	//u32 cmd = 0xE0000000;
+ 	TUXEDO_INFO("Set keyboard enabled to: %d\n", state);
+ 
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR)
++		return clevo_evaluate_method(CLEVO_METHOD_SET_WHITE_BRIGHTNESS,
++			state ? DIV_ROUND_CLOSEST(kbd_led_state.brightness * clevo_white_max,
++						  BRIGHTNESS_MAX) : 0, NULL);
++
+ 	//if (state == 0) {
+ 		//cmd |= 0x003001;
+ 	//} else {
+@@ -933,6 +984,21 @@
+ 	// TUXEDO_DEBUG("clevo event: %0#6x\n", event);
+ 
+ 	switch (key_event) {
++	case CLEVO_EVENT_CYCLE_BRIGHTNESS:
++		if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR) {
++			int err;
++
++			mutex_lock(&clevo_kbd_backlight_lock);
++			err = clevo_white_brightness_read();
++			if (!err)
++				clevo_kbd_brightness_notify();
++			mutex_unlock(&clevo_kbd_backlight_lock);
++			if (err)
++				TUXEDO_ERROR("Failed to read keyboard brightness: %d\n", err);
++			return;
++		}
++		break;
++
+ 	case CLEVO_EVENT_DECREASE_BACKLIGHT:
+ 		if (kbd_led_state.brightness == BRIGHTNESS_MIN
+ 		    || (kbd_led_state.brightness - 25) < BRIGHTNESS_MIN) {
+@@ -1085,6 +1151,8 @@
+ 
+ void clevo_keyboard_write_state(void)
+ {
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR)
++		return;
+ 	// Note:
+ 	// - set_blinking_pattern also writes colors
+ 	// - set_brightness, set_enabled, set_blinking_pattern
+@@ -1201,15 +1269,70 @@
+ 	return 0;
+ }
+ 
++static int clevo_detect_backlight(void)
++{
++	u32 features;
++	int err, i;
++
++	clevo_backlight_type = 0;
++	clevo_white_max = 2;
++	for (i = 0; i < 3; i++) {
++		if (!active_clevo_interface->get_specs)
++			break;
++		err = active_clevo_interface->get_specs(&clevo_backlight_type);
++		if (err || clevo_backlight_type)
++			break;
++		msleep(50);
++	}
++	if (!clevo_backlight_type) {
++		err = clevo_evaluate_method(CLEVO_METHOD_GET_BIOS_FEATURES_1, 0, &features);
++		if (err)
++			return err;
++		if (features & CLEVO_FEATURE_3_ZONE_RGB_KEYBOARD)
++			clevo_backlight_type = CLEVO_BACKLIGHT_3_ZONE_RGB;
++		else if (features & CLEVO_FEATURE_WHITE_KEYBOARD)
++			clevo_backlight_type = CLEVO_BACKLIGHT_FIXED_COLOR;
++	}
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR) {
++		err = clevo_evaluate_method(CLEVO_METHOD_GET_BIOS_FEATURES_2, 0, &features);
++		if (err)
++			TUXEDO_ERROR("Cannot detect white keyboard brightness range: %d\n", err);
++		else if (features & CLEVO_FEATURE_WHITE_FIVE_LEVELS)
++			clevo_white_max = 5;
++	}
++	return 0;
++}
++
+ static int clevo_keyboard_probe(struct platform_device *dev)
+ {
+ 	int err;
+ 
++	err = clevo_detect_backlight();
++	if (err)
++		dev_warn(&dev->dev, "Cannot detect keyboard backlight type: %d\n", err);
+ 	clevo_keyboard_init_device_interface(dev);
+ 	clevo_keyboard_init();
+ 
+-	clevo_kbd_backlight.name = "clevo::kbd_backlight";
+-	clevo_kbd_backlight.max_brightness = BRIGHTNESS_MAX;
++	if (clevo_backlight_type != CLEVO_BACKLIGHT_FIXED_COLOR &&
++	    clevo_backlight_type != CLEVO_BACKLIGHT_3_ZONE_RGB &&
++	    clevo_backlight_type != CLEVO_BACKLIGHT_1_ZONE_RGB) {
++		dev_warn(&dev->dev, "Unsupported keyboard backlight type: %#x\n",
++			 clevo_backlight_type);
++		return 0;
++	}
++	if (clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR) {
++		mutex_lock(&clevo_kbd_backlight_lock);
++		err = clevo_white_brightness_read();
++		mutex_unlock(&clevo_kbd_backlight_lock);
++		if (err) {
++			dev_err(&dev->dev, "Cannot read white keyboard brightness: %d\n", err);
++			return 0;
++		}
++	}
++	clevo_kbd_backlight.name = clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR ?
++		"white:kbd_backlight" : "clevo::kbd_backlight";
++	clevo_kbd_backlight.max_brightness = clevo_backlight_type == CLEVO_BACKLIGHT_FIXED_COLOR ?
++		clevo_white_max : BRIGHTNESS_MAX;
+ 	clevo_kbd_backlight.brightness_get = clevo_kbd_brightness_get;
+ 	clevo_kbd_backlight.brightness_set_blocking = clevo_kbd_brightness_set;
+ 	clevo_kbd_backlight.flags = LED_BRIGHT_HW_CHANGED | LED_RETAIN_AT_SHUTDOWN;
+@@ -1263,7 +1386,8 @@
+ static int clevo_keyboard_suspend(struct platform_device *dev, pm_message_t state)
+ {
+ 	// turning the keyboard off prevents default colours showing on resume
+-	set_enabled_cmd(0);
++	if (clevo_backlight_type != CLEVO_BACKLIGHT_FIXED_COLOR)
++		set_enabled_cmd(0);
+ 	return 0;
+ }
+ 
