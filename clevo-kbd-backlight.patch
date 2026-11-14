@@ -1,0 +1,213 @@
+--- a/src/clevo_keyboard.h
++++ b/src/clevo_keyboard.h
+@@ -20,6 +20,7 @@
+ #include <linux/version.h>
+ #include <linux/string.h>
+ #include <linux/dmi.h>
++#include <linux/leds.h>
+ 
+ #include "tuxedo_keyboard_common.h"
+ #include "clevo_interfaces.h"
+@@ -251,6 +252,28 @@
+ 	.whole_kbd_color  = 7
+ };
+ 
++static struct led_classdev clevo_kbd_backlight;
++static DEFINE_MUTEX(clevo_kbd_backlight_lock);
++static bool clevo_kbd_backlight_registered;
++
++static enum led_brightness clevo_kbd_brightness_get(struct led_classdev *led)
++{
++	enum led_brightness brightness;
++
++	mutex_lock(&clevo_kbd_backlight_lock);
++	brightness = kbd_led_state.enabled ? kbd_led_state.brightness : 0;
++	mutex_unlock(&clevo_kbd_backlight_lock);
++	return brightness;
++}
++
++/* Caller holds clevo_kbd_backlight_lock. */
++static void clevo_kbd_brightness_notify(void)
++{
++	if (clevo_kbd_backlight_registered)
++		led_classdev_notify_brightness_hw_changed(&clevo_kbd_backlight,
++			kbd_led_state.enabled ? kbd_led_state.brightness : 0);
++}
++
+ static struct blinking_pattern_t blinking_patterns[] = {
+ 	      { .key = 0,.value = 0,.name = "CUSTOM"},
+ 	      { .key = 1,.value = 0x1002a000,.name = "BREATHE"},
+@@ -379,18 +402,44 @@
+ }
+ EXPORT_SYMBOL(clevo_get_active_interface_id);
+ 
+-static void set_brightness(u8 brightness)
++static int clevo_set_brightness(u8 brightness)
+ {
++	int err;
++
+ 	TUXEDO_INFO("Set brightness on %d", brightness);
+-	if (!clevo_evaluate_method
+-	    (CLEVO_METHOD_ID_SET_KB_LEDS, 0xF4000000 | brightness, NULL)) {
+-		kbd_led_state.brightness = brightness;
+-	  if (brightness != 0) {
+-	    kbd_led_state.enabled = 1;
+-	  } else {
+-	    kbd_led_state.enabled = 0;
+-	  }
++	err = clevo_evaluate_method(CLEVO_METHOD_ID_SET_KB_LEDS,
++				    KEYBOARD_BRIGHTNESS | brightness, NULL);
++	if (err) {
++		TUXEDO_ERROR("Failed to set keyboard brightness: %d\n", err);
++		return err;
+ 	}
++
++	kbd_led_state.brightness = brightness;
++	kbd_led_state.enabled = brightness != 0;
++	return 0;
++}
++
++static int set_brightness(u8 brightness)
++{
++	int err;
++
++	mutex_lock(&clevo_kbd_backlight_lock);
++	err = clevo_set_brightness(brightness);
++	if (!err)
++		clevo_kbd_brightness_notify();
++	mutex_unlock(&clevo_kbd_backlight_lock);
++	return err;
++}
++
++static int clevo_kbd_brightness_set(struct led_classdev *led,
++				   enum led_brightness brightness)
++{
++	int err;
++
++	mutex_lock(&clevo_kbd_backlight_lock);
++	err = clevo_set_brightness(brightness);
++	mutex_unlock(&clevo_kbd_backlight_lock);
++	return err;
+ }
+ 
+ static ssize_t set_brightness_fs(struct device *child,
+@@ -406,7 +455,9 @@
+ 	}
+ 
+ 	val = clamp_t(u8, val, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+-	set_brightness(val);
++	err = set_brightness(val);
++	if (err)
++		return err;
+ 
+ 	return size;
+ }
+@@ -430,11 +481,20 @@
+ 	}
+ }
+ 
+-static void set_enabled(u8 state)
++static int set_enabled(u8 state)
+ {
+-	if (!set_enabled_cmd(state)) {
++	int err;
++
++	mutex_lock(&clevo_kbd_backlight_lock);
++	err = set_enabled_cmd(state);
++	if (err) {
++		TUXEDO_ERROR("Failed to set keyboard state: %d\n", err);
++	} else {
+ 		kbd_led_state.enabled = state;
++		clevo_kbd_brightness_notify();
+ 	}
++	mutex_unlock(&clevo_kbd_backlight_lock);
++	return err;
+ }
+ 
+ static ssize_t set_state_fs(struct device *child, struct device_attribute *attr,
+@@ -449,7 +509,9 @@
+ 
+ 	state = clamp_t(u8, state, 0, 1);
+ 
+-	set_enabled(state);
++	err = set_enabled(state);
++	if (err)
++		return err;
+ 
+ 	return size;
+ }
+@@ -597,6 +659,8 @@
+ 	u32 numpad_color, u32 lightbar_color, u8 brightness)
+ {
+ 	int err;
++
++	mutex_lock(&clevo_kbd_backlight_lock);
+ 	if (0 == (err = set_zonekb_color_base(left_color, center_color,
+ 		right_color, numpad_color, lightbar_color, brightness))) {
+ 		kbd_led_state.color.left   = left_color;
+@@ -605,7 +669,10 @@
+ 		kbd_led_state.color.numpad = numpad_color;
+ 		kbd_led_state.color.extra  = lightbar_color;
+ 		kbd_led_state.brightness   = brightness;
++		kbd_led_state.enabled      = brightness != 0;
++		clevo_kbd_brightness_notify();
+ 	}
++	mutex_unlock(&clevo_kbd_backlight_lock);
+ 	return err;
+ }
+ 
+@@ -903,6 +970,13 @@
+ 		break;
+ 	}
+ 
++	/* The driver already handled these; forwarding them lets Plasma do it twice. */
++	if (READ_ONCE(clevo_kbd_backlight_registered) &&
++	    (key_event == CLEVO_EVENT_DECREASE_BACKLIGHT ||
++	     key_event == CLEVO_EVENT_INCREASE_BACKLIGHT ||
++	     key_event == CLEVO_EVENT_TOGGLE_STATE))
++		return;
++
+ 	if (current_driver != NULL && current_driver->input_device != NULL) {
+ 		if (!sparse_keymap_report_known_event(
+ 			    current_driver->input_device, key_event, 1, true)) {
+@@ -1129,9 +1203,25 @@
+ 
+ static int clevo_keyboard_probe(struct platform_device *dev)
+ {
++	int err;
++
+ 	clevo_keyboard_init_device_interface(dev);
+ 	clevo_keyboard_init();
+ 
++	clevo_kbd_backlight.name = "clevo::kbd_backlight";
++	clevo_kbd_backlight.max_brightness = BRIGHTNESS_MAX;
++	clevo_kbd_backlight.brightness_get = clevo_kbd_brightness_get;
++	clevo_kbd_backlight.brightness_set_blocking = clevo_kbd_brightness_set;
++	clevo_kbd_backlight.flags = LED_BRIGHT_HW_CHANGED | LED_RETAIN_AT_SHUTDOWN;
++	err = led_classdev_register(&dev->dev, &clevo_kbd_backlight);
++	if (err) {
++		dev_err(&dev->dev, "Failed to register keyboard backlight LED: %d\n", err);
++	} else {
++		mutex_lock(&clevo_kbd_backlight_lock);
++		WRITE_ONCE(clevo_kbd_backlight_registered, true);
++		mutex_unlock(&clevo_kbd_backlight_lock);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1156,6 +1246,14 @@
+ static void clevo_keyboard_remove(struct platform_device *dev)
+ #endif
+ {
++	mutex_lock(&clevo_kbd_backlight_lock);
++	if (clevo_kbd_backlight_registered) {
++		WRITE_ONCE(clevo_kbd_backlight_registered, false);
++		mutex_unlock(&clevo_kbd_backlight_lock);
++		led_classdev_unregister(&clevo_kbd_backlight);
++	} else {
++		mutex_unlock(&clevo_kbd_backlight_lock);
++	}
+ 	clevo_keyboard_remove_device_interface(dev);
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+ 	return 0;
